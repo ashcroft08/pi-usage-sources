@@ -115,6 +115,10 @@ root. Point it anywhere else with `GENTLE_PI_CONTRACT_FILES`.
 ## Publishing to npm
 
 This package is `private: true` on purpose, so an accidental `npm publish`
-cannot happen. To publish it: drop `private`, add `license`, `repository` and
-`author`, then `npm publish`. The `pi-package` keyword makes it eligible for the
-Pi package gallery.
+cannot happen. To publish it: drop `private`, add `repository`, then run
+`npm publish`. The `pi-package` keyword makes it eligible for the Pi package
+gallery.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
