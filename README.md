@@ -39,10 +39,10 @@ this folder changes behaviour after the next pi restart. Remove it with
 `pi remove <path>`, or drop the entry from that home's `settings.json`
 `packages` list.
 
-From a git checkout instead:
+Install straight from the repository:
 
 ```sh
-pi install git:github.com/<user>/<repo>
+pi install git:github.com/ashcroft08/pi-usage-sources
 ```
 
 Requirements on the machine: **pi** with **gentle-pi** (anyone running
