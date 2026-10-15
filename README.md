@@ -122,3 +122,25 @@ gallery.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Prior art
+
+This is **not** the first usage source for Gentle Shell. The contract
+(`gentle-pi:usage-source/v1`, added in gentle-shell #1300) already had
+implementations when this package was written, and they cover other providers:
+
+| Project | Registers | Since |
+|---|---|---|
+| [manutepowa/pi-opencode-go-usage](https://github.com/manutepowa/pi-opencode-go-usage) | `opencode-go` | 2026-09-23 |
+| [danielgap/pi-zai-usage](https://github.com/danielgap/pi-zai-usage) | z.ai GLM coding plan | 2026-09-11 |
+| [danielgap/pi-claude-usage](https://github.com/danielgap/pi-claude-usage) | Claude via pi-claude-bridge | 2026-10-08 |
+| [`@narumitw/pi-usage`](https://www.npmjs.com/package/@narumitw/pi-usage) | several providers | - |
+
+If you only need OpenCode Go, `pi-opencode-go-usage` got there first and is the
+older pick for that provider alone.
+
+What this package adds on top of them is **Antigravity through the official `agy`
+CLI** - no Google token of its own and no `User-Agent` impersonation - plus the
+OpenCode Go reset field that the open built-in pull requests read under the wrong
+name (`resetsAt`, not `resetAt`), which is why the built-in path shows a meter
+with no reset countdown.
