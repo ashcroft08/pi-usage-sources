@@ -1,0 +1,15 @@
+{
+  "name": "pi-usage-sources",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gentle Shell usage sources for OpenCode Go and Antigravity (agy CLI)",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/usage-sources.ts"
+    ]
+  }
+}

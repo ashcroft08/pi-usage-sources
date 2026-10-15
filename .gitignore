@@ -1,0 +1,9 @@
+# Not shipped: a local package is loaded from this folder, nothing here is built.
+node_modules/
+*.log
+
+# Internal ODD tracking: specs and logs with local machine details and account
+# usage numbers. Delete this line to version them too.
+odd/
+
+.DS_Store

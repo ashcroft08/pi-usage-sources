@@ -1,0 +1,2 @@
+# Keep one line ending everywhere: pi loads these TypeScript files as-is.
+* text=auto eol=lf
