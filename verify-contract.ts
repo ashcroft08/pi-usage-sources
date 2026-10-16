@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { buildSources, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "./src/sources.ts";
+import { buildSources, createClaudeBridgeSource, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "./src/sources.ts";
 
 const RELATIVE = path.join("npm", "node_modules", "gentle-pi", "lib", "shell-usage.ts");
 
@@ -48,7 +48,11 @@ if (files.length === 0) {
 	process.exit(2);
 }
 
-const sources = buildSources({});
+// Every source this package registers, stateless or not: the shell validates
+// the registration payload, never the numbers behind it, so the Claude source
+// is checked here exactly as it is emitted (built now, registered once it has a
+// snapshot to answer with).
+const sources = [...buildSources({}), createClaudeBridgeSource().source];
 let failures = 0;
 const check = (label: string, ok: boolean, detail: string) => {
 	if (!ok) failures += 1;
