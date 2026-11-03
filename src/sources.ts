@@ -1,14 +1,16 @@
-// Usage sources for Gentle Shell: OpenCode Go (HTTP) and Antigravity (agy CLI).
+// Usage sources for Gentle Shell: OpenCode Go (HTTP), Antigravity (agy CLI)
+// and Claude (pi-claude-bridge)
 //
 // Gentle Shell exposes a provider-neutral contract: an extension emits
 // `gentle-pi:usage-source/v1` on `pi.events` with
 // { schema, provider, pendingNote?, fetch(apiKey, fetchFn, now) }, and the shell
 // treats that provider exactly like its own built-ins. This module builds the
-// two sources; it never prints, logs, or stores a credential.
+// sources; it never prints, logs, or stores a credential.
 //
-// It exists because those two providers have no built-in fetcher: without it,
-// both the header's usage segment and the alt+u panel answer "no subscription
-// usage for this provider" forever. No setting changes that.
+// It exists because those providers have no built-in fetcher: without it, both
+// the header's usage segment and the alt+u panel answer "no subscription usage
+// for this provider" forever. No setting changes that. Claude is the one source
+// fed by events rather than by a fetch (see createClaudeBridgeSource).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,10 +51,13 @@ export interface SourceDeps {
 	fetchFn?: typeof fetch;
 	runAgyJson?: (binary: string) => Promise<string | undefined>;
 	agyBinary?: string;
+	now?: () => number;
+	claudeBridge?: ClaudeBridgeDeps;
 }
 
 export const OPENCODE_GO_PROVIDER = "opencode-go";
 export const ANTIGRAVITY_PROVIDER = "antigravity";
+export const CLAUDE_BRIDGE_PROVIDER = "claude-bridge";
 const OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/usage";
 const AGY_ARGS = ["--print", "/usage", "--output-format", "json", "--print-timeout", "30s"];
 
@@ -64,6 +69,15 @@ const AGY_BUDGET_MS = 8_000;
 const FIVE_HOURS = 18_000;
 const WEEK = 604_800;
 const MONTH = 30 * 86_400;
+// Anthropic's own unified rate-limit header names, which is what the bridge
+// rebuilds from Claude Code's rate_limit_event. Same names the shell's built-in
+// anthropic parser reads, so the numbers mean the same thing on both paths.
+const UNIFIED_PREFIX = "anthropic-ratelimit-unified-";
+const CLAUDE_MAIN_LIMIT = "claude";
+const CLAUDE_WINDOWS: ReadonlyArray<[key: string, label: string, seconds: number]> = [
+	["5h", "5h", FIVE_HOURS],
+	["7d", "week", WEEK],
+];
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
@@ -260,7 +274,116 @@ function readKeyFromFile(file: string): string | undefined {
 	}
 }
 
-/** The two sources, ready to emit on `gentle-pi:usage-source/v1`. */
+/**
+ * Map the unified rate-limit headers pi-claude-bridge hands to pi's
+ * `after_provider_response`.
+ *
+ * Claude Code reports plan usage as SDK `rate_limit_event` messages rather than
+ * HTTP headers, so the bridge rebuilds Anthropic's own header names from them
+ * (`five_hour` -> `5h`, `seven_day` -> `7d`). `utilization` is a fraction and
+ * `resetsAt` is Unix seconds on both paths.
+ *
+ * Returns undefined when no window carries a percentage: a bridge that answered
+ * with status alone reported no per-window usage, which is nothing to render.
+ */
+export function mapClaudeBridgeHeaders(headers: Record<string, string>, now: number, plan?: string): ProviderUsage | undefined {
+	const windows: UsageWindow[] = [];
+	for (const [key, label, seconds] of CLAUDE_WINDOWS) {
+		const fraction = Number.parseFloat(headers[`${UNIFIED_PREFIX}${key}-utilization`] ?? "");
+		if (!Number.isFinite(fraction)) continue;
+		const reset = Number.parseInt(headers[`${UNIFIED_PREFIX}${key}-reset`] ?? "", 10);
+		windows.push({
+			label,
+			usedPercent: clampPercent(fraction * 100),
+			windowSeconds: seconds,
+			resetAt: Number.isFinite(reset) ? reset * 1000 : null,
+		});
+	}
+	if (windows.length === 0) return undefined;
+	return {
+		provider: CLAUDE_BRIDGE_PROVIDER,
+		plan,
+		limits: [{ name: CLAUDE_MAIN_LIMIT, windows, limitReached: headers[`${UNIFIED_PREFIX}status`] === "rejected" }],
+		fetchedAt: now,
+	};
+}
+
+/**
+ * The plan label, from the store Claude Code already owns. Read-only, and only
+ * this one field: the OAuth token that sits beside it is never read, kept,
+ * logged, or returned. Claude Code keeps its store in the Keychain on macOS, so
+ * there the file is simply absent and the label stays empty.
+ *
+ * CLAUDE_CREDENTIALS is an exclusive override, like OPENCODE_GO_AUTH: when it is
+ * set it is the only file read, so a test can point at a store without the
+ * machine's own Claude Code store answering instead.
+ */
+export function readClaudePlan(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const file = env.CLAUDE_CREDENTIALS ?? path.join(env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"), ".credentials.json");
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { claudeAiOauth?: { subscriptionType?: unknown } };
+		const plan = parsed?.claudeAiOauth?.subscriptionType;
+		return typeof plan === "string" && plan.trim().length > 0 ? plan.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export interface ClaudeBridgeDeps {
+	/** The plan label reader. Injected by tests; the real store by default. */
+	readPlan?: () => string | undefined;
+}
+
+export interface ClaudeBridgeSource {
+	/** Remembers one captured header set. True when it produced a snapshot. */
+	capture(headers: Record<string, string>, now: number): boolean;
+	hasSnapshot(): boolean;
+	/** The source to emit on `gentle-pi:usage-source/v1`. */
+	source: UsageSource;
+}
+
+/**
+ * Claude's plan usage arrives with responses, not from a fetch, so this source
+ * answers the last captured snapshot instead of asking an endpoint.
+ *
+ * It is registered only once there is a snapshot to answer with: registering a
+ * provider the shell then tries to fetch would record a failed refresh for a
+ * provider nothing was ever asked of, which is exactly the wrong story to tell
+ * before Claude Code has reported anything. Every later capture re-emits the
+ * source, and a re-registration makes the shell refresh that provider at once.
+ */
+export function createClaudeBridgeSource(deps: ClaudeBridgeDeps = {}): ClaudeBridgeSource {
+	let latest: ProviderUsage | undefined;
+	// The plan is read at most once per process, on the first snapshot: a label
+	// that changes mid-session is not worth a store read on every turn.
+	let plan: string | undefined;
+	let planRead = false;
+	const planLabel = (): string | undefined => {
+		if (!planRead) {
+			planRead = true;
+			plan = deps.readPlan ? deps.readPlan() : readClaudePlan();
+		}
+		return plan;
+	};
+	const source: UsageSource = {
+		schema: USAGE_SOURCE_SCHEMA,
+		provider: CLAUDE_BRIDGE_PROVIDER,
+		pendingNote: "usage arrives with the first response",
+		fetch: async () => latest,
+	};
+	return {
+		source,
+		hasSnapshot: () => latest !== undefined,
+		capture: (headers, now) => {
+			const usage = mapClaudeBridgeHeaders(headers, now);
+			if (!usage) return false;
+			latest = { ...usage, plan: planLabel() };
+			return true;
+		},
+	};
+}
+
+/** The two sources with no state of their own, ready to emit on the event. */
 export function buildSources(deps: SourceDeps = {}): UsageSource[] {
 	const env = deps.env ?? process.env;
 	const runAgy = deps.runAgyJson ?? ((binary: string) => runAgyJson(binary));
