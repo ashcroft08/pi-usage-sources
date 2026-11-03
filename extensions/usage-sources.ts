@@ -1,4 +1,4 @@
-// Gentle Shell usage sources for OpenCode Go, Antigravity and Claude.
+// Gentle Shell usage sources for OpenCode Go, Antigravity, Command Code and Claude.
 //
 // The shell (gentle-pi) consumes `gentle-pi:usage-source/v1` from `pi.events`;
 // this extension only builds the sources and hands them over. Registering
