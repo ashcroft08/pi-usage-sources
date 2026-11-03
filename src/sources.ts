@@ -1,5 +1,5 @@
-// Usage sources for Gentle Shell: OpenCode Go (HTTP), Antigravity (agy CLI)
-// and Claude (pi-claude-bridge)
+// Usage sources for Gentle Shell: OpenCode Go (HTTP), Antigravity (agy CLI),
+// Command Code (HTTP) and Claude (pi-claude-bridge)
 //
 // Gentle Shell exposes a provider-neutral contract: an extension emits
 // `gentle-pi:usage-source/v1` on `pi.events` with
@@ -58,6 +58,8 @@ export interface SourceDeps {
 export const OPENCODE_GO_PROVIDER = "opencode-go";
 export const ANTIGRAVITY_PROVIDER = "antigravity";
 export const CLAUDE_BRIDGE_PROVIDER = "claude-bridge";
+export const COMMAND_CODE_PROVIDER = "commandcode";
+const COMMAND_CODE_API_URL = "https://api.commandcode.ai";
 const OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/usage";
 const AGY_ARGS = ["--print", "/usage", "--output-format", "json", "--print-timeout", "30s"];
 
@@ -186,6 +188,170 @@ export function mapAntigravityEnvelope(payload: unknown, now: number): ProviderU
 	}
 	if (limits.length === 0) return undefined;
 	return { provider: ANTIGRAVITY_PROVIDER, limits, fetchedAt: now };
+}
+
+/** Command Code reports reset times as epoch milliseconds; accept seconds and ISO too. */
+function commandCodeReset(value: unknown): number | null {
+	const number = finite(value);
+	if (number !== undefined) return number >= 0 ? (number >= 1e12 ? number : number * 1000) : null;
+	return timestamp(value);
+}
+
+function nonNegative(value: unknown): number | undefined {
+	const number = finite(value);
+	return number !== undefined && number >= 0 ? number : undefined;
+}
+
+/**
+ * Map Command Code's quota payloads: the 5h and weekly window caps and the
+ * monthly credit pool from `/alpha/billing/credits`, the plan and billing
+ * period from `/alpha/billing/subscriptions`, and the period's spend from
+ * `/alpha/usage/summary`. Same flow as the provider plugin's
+ * `/commandcode-quota`. Account identity is never read, so it cannot leak.
+ */
+export function mapCommandCodeUsage(credits: unknown, subscription: unknown, summary: unknown, now: number): ProviderUsage | undefined {
+	const root = record(credits);
+	const caps = record(root?.windowLimits);
+	const windows: UsageWindow[] = [];
+	for (const [key, label, seconds] of [
+		["fiveHour", "5h", FIVE_HOURS],
+		["weekly", "week", WEEK],
+	] as const) {
+		const raw = record(caps?.[key]);
+		const used = nonNegative(raw?.used);
+		const cap = nonNegative(raw?.cap);
+		if (!raw || used === undefined || cap === undefined || cap <= 0) continue;
+		// `used` and `cap` are in credits and the caps differ per window, so the
+		// percentage is each window's own ratio.
+		windows.push({ label, usedPercent: clampPercent((used / cap) * 100), windowSeconds: seconds, resetAt: commandCodeReset(raw.resetAt) });
+	}
+	const limits: UsageLimit[] = [];
+	if (windows.length > 0) {
+		limits.push({ name: "command code", windows, limitReached: windows.some((window) => window.usedPercent >= 100) });
+	}
+
+	const data = record(record(subscription)?.data);
+	const pool = record(root?.credits);
+	const balances = [nonNegative(pool?.monthlyCredits), nonNegative(pool?.purchasedCredits), nonNegative(pool?.freeCredits)];
+	const spent = nonNegative(record(summary)?.totalCost);
+	// Without a real balance the pool is unknown, and an invented zero would
+	// read as an exhausted plan.
+	if (spent !== undefined && balances.some((value) => value !== undefined)) {
+		const remaining = balances.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+		if (remaining + spent > 0) {
+			const resetAt = commandCodeReset(data?.currentPeriodEnd);
+			const periodStart = commandCodeReset(data?.currentPeriodStart);
+			const seconds = resetAt !== null && periodStart !== null ? Math.max(0, Math.round((resetAt - periodStart) / 1000)) : 0;
+			limits.push({
+				name: "credits",
+				windows: [{ label: "billing", usedPercent: clampPercent((spent / (remaining + spent)) * 100), windowSeconds: seconds, resetAt }],
+				limitReached: remaining <= 0,
+			});
+		}
+	}
+	if (limits.length === 0) return undefined;
+	const planId = typeof data?.planId === "string" ? data.planId.replace(/[_-]+/g, " ").trim() : "";
+	return { provider: COMMAND_CODE_PROVIDER, plan: planId.length > 0 ? planId : undefined, limits, fetchedAt: now };
+}
+
+/**
+ * Normalize the API root the same way the plugin does (its provider base ends in
+ * `/provider/v1`, the quota paths hang off the bare root) and refuse to send a
+ * credential over cleartext to anything but loopback.
+ */
+function commandCodeApiBase(value: string): string | undefined {
+	try {
+		const url = new URL(value);
+		const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+		if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return undefined;
+		if (url.username || url.password || url.search || url.hash) return undefined;
+		url.pathname = url.pathname.replace(/\/provider\/v1\/?$/, "").replace(/\/+$/, "");
+		return url.toString().replace(/\/$/, "");
+	} catch {
+		return undefined;
+	}
+}
+
+/** Fetch one Command Code snapshot through its dependent requests. Never throws. */
+export async function fetchCommandCodeUsage(
+	token: string,
+	fetchFn: typeof fetch,
+	now: number,
+	baseUrl: string = COMMAND_CODE_API_URL,
+	extraHeaders: Record<string, string> = {},
+): Promise<ProviderUsage | undefined> {
+	try {
+		const base = commandCodeApiBase(baseUrl);
+		if (!base) return undefined;
+		// One deadline for the whole flow: four sequential requests, and the shell
+		// discards an answer that lands after its own 10s budget.
+		const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+		const headers = { Authorization: `Bearer ${token}`, Accept: "application/json", ...extraHeaders };
+		const get = async (route: string): Promise<unknown> => {
+			const response = await fetchFn(`${base}${route}`, { headers, signal, redirect: "error" });
+			if (!response.ok) return undefined;
+			try {
+				return await response.json();
+			} catch {
+				return undefined;
+			}
+		};
+		const whoami = record(await get("/alpha/whoami"));
+		if (!whoami) return undefined;
+		// An account without an organization answers `org: null`.
+		const orgId = record(whoami.org)?.id;
+		const org = typeof orgId === "string" && orgId.length > 0 ? orgId : undefined;
+		const orgQuery = org ? `?orgId=${encodeURIComponent(org)}` : "";
+		const [credits, subscription] = await Promise.all([get(`/alpha/billing/credits${orgQuery}`), get(`/alpha/billing/subscriptions${orgQuery}`)]);
+		if (!credits) return undefined;
+		const start = record(record(subscription)?.data)?.currentPeriodStart;
+		const query = [org ? `orgId=${encodeURIComponent(org)}` : "", typeof start === "string" && start.length > 0 ? `since=${encodeURIComponent(start)}` : ""]
+			.filter(Boolean)
+			.join("&");
+		const summary = await get(`/alpha/usage/summary${query ? `?${query}` : ""}`);
+		return mapCommandCodeUsage(credits, subscription, summary, now);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The Command Code credential: the one the shell passed when it has one, else
+ * the same places the provider plugin looks, in its order. Only the access (or
+ * API) token is read; the refresh token beside it never is.
+ *
+ * COMMANDCODE_AUTH is an exclusive override, like OPENCODE_GO_AUTH: when it is
+ * set it is the only file read, so a test can point at a store without the
+ * machine's own one answering instead.
+ */
+export function readCommandCodeKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	if (env.COMMANDCODE_AUTH) return readCommandCodeKeyFromFile(env.COMMANDCODE_AUTH);
+	const fromEnv = env.COMMAND_CODE_API_KEY || env.COMMANDCODE_API_KEY;
+	if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim();
+	const candidates = [path.join(os.homedir(), ".commandcode", "auth.json"), path.join(os.homedir(), ".pi", "agent", "auth.json")];
+	if (env.PI_CODING_AGENT_DIR) candidates.push(path.join(env.PI_CODING_AGENT_DIR, "auth.json"));
+	for (const file of candidates) {
+		const key = readCommandCodeKeyFromFile(file);
+		if (key) return key;
+	}
+	return undefined;
+}
+
+function commandCodeCredential(value: unknown): string | undefined {
+	if (typeof value === "string") return value.trim().length > 0 ? value.trim() : undefined;
+	const entry = record(value);
+	if (!entry) return undefined;
+	const token = entry.type === "oauth" ? entry.access : entry.type === "api" ? entry.key : (entry.access ?? entry.key);
+	return typeof token === "string" && token.trim().length > 0 ? token.trim() : undefined;
+}
+
+function readCommandCodeKeyFromFile(file: string): string | undefined {
+	try {
+		const parsed = record(JSON.parse(fs.readFileSync(file, "utf8")));
+		return commandCodeCredential(parsed?.apiKey) ?? commandCodeCredential(parsed?.commandcode) ?? commandCodeCredential(parsed?.["command-code"]);
+	} catch {
+		return undefined;
+	}
 }
 
 /** Fetch one OpenCode Go snapshot. Never throws, never returns a partial read. */
@@ -383,7 +549,7 @@ export function createClaudeBridgeSource(deps: ClaudeBridgeDeps = {}): ClaudeBri
 	};
 }
 
-/** The two sources with no state of their own, ready to emit on the event. */
+/** The sources with no state of their own, ready to emit on the event. */
 export function buildSources(deps: SourceDeps = {}): UsageSource[] {
 	const env = deps.env ?? process.env;
 	const runAgy = deps.runAgyJson ?? ((binary: string) => runAgyJson(binary));
@@ -415,5 +581,19 @@ export function buildSources(deps: SourceDeps = {}): UsageSource[] {
 		},
 	};
 
-	return [opencodeGo, antigravity];
+	const commandcode: UsageSource = {
+		schema: USAGE_SOURCE_SCHEMA,
+		provider: COMMAND_CODE_PROVIDER,
+		pendingNote: "no usage yet · r to fetch",
+		fetch: async (apiKey, fetchFn, now) => {
+			const token = apiKey?.trim() || readCommandCodeKey(env);
+			if (!token) return undefined;
+			// Same ZDR flag the plugin's /commandcode-quota sends, so the panel
+			// cannot disagree with it.
+			const zdr = env.CMD_ZDR === "1" || env.COMMANDCODE_ZDR === "1" ? { "x-cmd-zdr": "1" } : {};
+			return fetchCommandCodeUsage(token, fetchFn ?? deps.fetchFn ?? fetch, now, env.COMMANDCODE_API_BASE || COMMAND_CODE_API_URL, zdr);
+		},
+	};
+
+	return [opencodeGo, antigravity, commandcode];
 }
