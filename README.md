@@ -1,11 +1,11 @@
 # pi-usage-sources
 
-Gentle Shell usage sources for **OpenCode Go**, **Antigravity** (agy CLI) and
-**Claude** (pi-claude-bridge).
+Gentle Shell usage sources for **OpenCode Go**, **Antigravity** (agy CLI),
+**Command Code** and **Claude** (pi-claude-bridge).
 
 Without this extension, the header's `usage` segment and the `alt+u`
 Subscriptions panel answer `no subscription usage for this provider` for the
-first two providers, forever: gentle-pi ships built-in fetchers only for
+first three providers, forever: gentle-pi ships built-in fetchers only for
 `openai-codex`, `anthropic` and `nan`, and no setting changes that. For Claude
 the reason is different and worth knowing: gentle-pi's built-in `anthropic`
 parser does read the same unified headers the bridge emits, but it always files
@@ -22,6 +22,7 @@ one source per provider:
 |---|---|
 | `opencode-go` | `GET https://opencode.ai/zen/go/v1/usage`, rolling 5h / weekly / monthly |
 | `antigravity` | `agy --print /usage --output-format json`, the Gemini and Claude/GPT pools |
+| `commandcode` | the provider plugin's own quota flow: `/alpha/whoami`, `/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary` on `api.commandcode.ai`; 5h and weekly caps plus the monthly credits |
 | `claude-bridge` | the `anthropic-ratelimit-unified-*` headers the bridge rebuilds from Claude Code's `rate_limit_event`, 5h and weekly |
 
 A registered source wins over the shell's built-ins for that provider, so the
@@ -31,6 +32,11 @@ The agy path is deliberate. It spawns the supported CLI instead of calling the
 private quota endpoint that the CLI itself uses, so it needs no Google token of
 its own and no `User-Agent` impersonation, and it keeps working when the CLI
 works.
+
+The Command Code path follows the provider plugin's `/commandcode-quota` request
+for request (same endpoints, same `COMMANDCODE_API_BASE` and zero-data-retention
+flag), so the panel cannot disagree with that command and no endpoint is
+invented here. The account identity the API also returns is never read.
 
 The Claude path is deliberate for the same reason. Claude Code makes the calls
 and pi-claude-bridge reports what it reported, so this package needs no
@@ -71,6 +77,9 @@ gentle-shell has it), plus per provider:
   Without it the source reports no data - nothing breaks.
 - `antigravity`: the `agy` CLI installed and logged in. If it is not on `PATH`,
   set `AGY_BIN`.
+- `commandcode`: the `pi-commandcode-provider` package installed and logged in
+  (`/login` then Command Code). Without a credential the source reports no data -
+  nothing breaks.
 - `claude-bridge`: the `pi-claude-bridge` package installed and Claude Code
   logged into a subscription (`claude` then `/login`). Nothing else: the bridge
   and Claude Code own the account, and the numbers show up from the first Claude
@@ -88,6 +97,19 @@ this order:
    because gentle-shell runs every session under its own home
    (`~/.gentle-shell/agent`) and that store carries no `opencode-go` credential;
 4. `$PI_CODING_AGENT_DIR/auth.json`.
+
+The Command Code token is the one the provider plugin already uses. It is read
+per fetch, in this order:
+
+1. the credential the shell passes for that provider, when it has one;
+2. `$COMMANDCODE_AUTH` - an exclusive override, always a file path;
+3. `$COMMAND_CODE_API_KEY` / `$COMMANDCODE_API_KEY`;
+4. `~/.commandcode/auth.json`, `~/.pi/agent/auth.json`, then
+   `$PI_CODING_AGENT_DIR/auth.json`.
+
+Only the access (or API) token is read; the OAuth refresh token beside it never
+is. It is sent only to the Command Code API (HTTPS, or loopback for local
+development) and redirects are refused.
 
 Antigravity needs no credential here: agy owns the account and the CLI answers
 with the session it already has.
@@ -109,6 +131,14 @@ Percentages are always **used**, never remaining:
 - OpenCode Go reports `percent`, which is already usage.
 - agy reports `remaining_fraction`, which is what is left, so the source inverts
   it: `usedPercent = (1 - remaining) * 100`.
+- Command Code reports `used` and `cap` per window in credits, so the source
+  divides them: `usedPercent = used / cap * 100`. The caps differ (5h and weekly),
+  which is why each window has its own ratio. Its `resetAt` is epoch
+  **milliseconds** (seconds and ISO are accepted too). The extra `credits` row
+  (`billing` window) is the month's spend against the pool: `totalCost /
+  (remaining credits + totalCost)`, resetting at the subscription's period end;
+  it only appears when the payload carries a real balance. The plan is `planId`
+  made readable (`individual-go-v1` -> `individual go v1`).
 - Claude reports `utilization` as a fraction on the unified headers, so the
   source multiplies by 100 and clamps to 0-100. A window whose header carries no
   `-utilization` is not a window and is dropped, never defaulted; `status:
@@ -126,6 +156,9 @@ does not put them in the `unifiedWindows` the bridge forwards - so a plan that
 has them simply shows the two account windows here.
 
 ## Timing
+
+Command Code makes four requests (the first one, then two in parallel, then the
+summary) under one 8s deadline and answers in ~1-2s.
 
 agy answers in ~3s. The shell's own fetch budget is 10s
 (`GENTLE_PI_SHELL_USAGE_TIMEOUT_MS`) and a late answer is discarded, so the spawn
@@ -154,13 +187,13 @@ bar.
 ## Verify
 
 ```sh
-node --experimental-strip-types --test tests/sources.test.ts   # 17 deterministic tests, no network
+node --experimental-strip-types --test tests/sources.test.ts   # 28 deterministic tests, no network
 node verify-live.ts                                           # real accounts, real agy
 node verify-contract.ts                                       # the shell's own validator gates
 ```
 
 `verify-live.ts` prints the current windows and never prints a credential. It
-covers the two providers that fetch; the Claude parser is pinned instead against
+covers the three providers that fetch; the Claude parser is pinned instead against
 the real shape, taken from `claude --print --verbose --output-format stream-json`
 (CLI 2.1.301), whose `rate_limit_event` is what the bridge rebuilds the headers
 from.
