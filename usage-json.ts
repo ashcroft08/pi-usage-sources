@@ -6,11 +6,15 @@
 // stdout carries the document and nothing else. Exit 0 means a document was
 // printed, even when every provider failed: the reader decides from the
 // statuses. A non-zero exit means no document at all.
-import { buildSources } from "./src/sources.ts";
+import { buildSources, createClaudeBridgeSource, fileSnapshotStore } from "./src/sources.ts";
 import { collectUsageJson, serializeUsageJson, shortReason } from "./src/usage-json.ts";
 
 try {
-	const document = await collectUsageJson(buildSources({}));
+	// Claude has nothing to fetch: it answers the last snapshot a session
+	// persisted, and reports no-data when there is none or all of it has reset.
+	const claude = createClaudeBridgeSource({ store: fileSnapshotStore() });
+	claude.restore(Date.now());
+	const document = await collectUsageJson([...buildSources({}), claude.source]);
 	process.stdout.write(serializeUsageJson(document));
 } catch (error) {
 	// The only failure is a document that could not be built: a provider that

@@ -17,6 +17,9 @@ import {
 	CLAUDE_BRIDGE_PROVIDER,
 	COMMAND_CODE_PROVIDER,
 	createClaudeBridgeSource,
+	claudeSnapshotFile,
+	fileSnapshotStore,
+	type ClaudeSnapshotStore,
 	fetchCommandCodeUsage,
 	mapAntigravityEnvelope,
 	mapClaudeBridgeHeaders,
@@ -26,7 +29,9 @@ import {
 	readCommandCodeKey,
 	USAGE_SOURCE_EVENT,
 	USAGE_SOURCE_SCHEMA,
+	type ProviderUsage,
 } from "../src/sources.ts";
+import { collectUsageJson } from "../src/usage-json.ts";
 
 const NOW = 1_792_000_000_000;
 
@@ -394,6 +399,127 @@ test("the claude-bridge source reads the plan from Claude Code's store once", as
 	}
 });
 
+function memoryStore(initial?: ProviderUsage): ClaudeSnapshotStore & { saved?: ProviderUsage } {
+	const store: ClaudeSnapshotStore & { saved?: ProviderUsage } = {
+		saved: initial,
+		read: () => store.saved,
+		write: (usage) => {
+			store.saved = usage;
+		},
+	};
+	return store;
+}
+
+test("a claude-bridge capture is persisted and restored by the next process", async () => {
+	const store = memoryStore();
+	const first = createClaudeBridgeSource({ readPlan: () => "max", store });
+	assert.equal(first.capture(CLAUDE_HEADERS, NOW), true);
+	// The plan label is re-read on restore; only the numbers are stored.
+	assert.equal(store.saved?.plan, undefined);
+	assert.equal(store.saved?.fetchedAt, NOW);
+
+	const second = createClaudeBridgeSource({ readPlan: () => "max", store });
+	assert.equal(second.hasSnapshot(), false);
+	assert.equal(second.restore(NOW + 60_000), true);
+	assert.equal(second.hasSnapshot(), true);
+	const usage = await second.source.fetch(undefined, async () => new Response("{}"), NOW + 90_000);
+	assert.equal(usage?.plan, "max");
+	// The restored numbers keep the moment they were true.
+	assert.equal(usage?.fetchedAt, NOW);
+	assert.equal(usage?.limits[0]?.windows.length, 2);
+});
+
+test("restoring a claude-bridge snapshot drops windows that already reset", async () => {
+	const store = memoryStore();
+	createClaudeBridgeSource({ store }).capture(CLAUDE_HEADERS, NOW);
+	// 5h resets at 1792131600s, the week at 1792375200s.
+	const afterFiveHours = 1_792_131_600_000 + 1;
+	const partial = createClaudeBridgeSource({ store });
+	assert.equal(partial.restore(afterFiveHours), true);
+	const usage = await partial.source.fetch(undefined, async () => new Response("{}"), afterFiveHours);
+	assert.deepEqual(usage?.limits[0]?.windows.map((window) => window.label), ["week"]);
+
+	const expired = createClaudeBridgeSource({ store });
+	assert.equal(expired.restore(1_792_375_200_000 + 1), false);
+	assert.equal(expired.hasSnapshot(), false);
+});
+
+test("restore never replaces a newer in-memory capture and ignores a broken store", async () => {
+	const store = memoryStore();
+	createClaudeBridgeSource({ store }).capture(CLAUDE_HEADERS, NOW);
+	const live = createClaudeBridgeSource({ store });
+	live.capture({ ...CLAUDE_HEADERS, "anthropic-ratelimit-unified-5h-utilization": "0.5" }, NOW + 10);
+	assert.equal(live.restore(NOW + 20), false);
+	assert.equal((await live.source.fetch(undefined, async () => new Response("{}"), NOW + 20))?.limits[0]?.windows[0]?.usedPercent, 50);
+
+	// A foreign or malformed stored value is not a snapshot.
+	const foreign = createClaudeBridgeSource({ store: memoryStore({ provider: "anthropic", limits: [], fetchedAt: NOW }) });
+	assert.equal(foreign.restore(NOW), false);
+	const malformed = createClaudeBridgeSource({
+		store: memoryStore({ provider: "claude-bridge", fetchedAt: NOW, limits: [{ name: "claude", limitReached: false, windows: [{ label: "5h", usedPercent: "x" }] }] } as never),
+	});
+	assert.equal(malformed.restore(NOW), false);
+
+	// A store that throws never breaks a capture or a restore.
+	const broken: ClaudeSnapshotStore = {
+		read: () => {
+			throw new Error("disk gone");
+		},
+		write: () => {
+			throw new Error("disk full");
+		},
+	};
+	const source = createClaudeBridgeSource({ store: broken });
+	assert.equal(source.restore(NOW), false);
+	assert.equal(source.capture(CLAUDE_HEADERS, NOW), true);
+});
+
+test("the file snapshot store round-trips and survives garbage", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usage-sources-snapshot-"));
+	try {
+		const file = path.join(dir, "nested", "claude-bridge.json");
+		const store = fileSnapshotStore(file);
+		assert.equal(store.read(), undefined);
+		createClaudeBridgeSource({ store }).capture(CLAUDE_HEADERS, NOW);
+		const restored = fileSnapshotStore(file).read();
+		assert.equal(restored?.provider, "claude-bridge");
+		assert.equal(restored?.fetchedAt, NOW);
+		fs.writeFileSync(file, "{not json");
+		assert.equal(fileSnapshotStore(file).read(), undefined);
+		assert.equal(claudeSnapshotFile({ CLAUDE_USAGE_SNAPSHOT: file }), file);
+		assert.match(claudeSnapshotFile({}), /claude-bridge\.json$/);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the extension answers Claude from the persisted snapshot at start", async () => {
+	const store = memoryStore();
+	createClaudeBridgeSource({ store }).capture(CLAUDE_HEADERS, NOW);
+	const emitted: Array<{ payload: { provider: string } }> = [];
+	const fakePi = {
+		events: { emit: (_name: string, payload: unknown) => emitted.push({ payload: payload as { provider: string } }) },
+		on: () => undefined,
+	};
+	const extensionModule = await import("../extensions/usage-sources.ts");
+	extensionModule.default(fakePi as never, { now: () => NOW + 1, claudeBridge: { readPlan: () => "max", store } } as never);
+	assert.deepEqual(emitted.map((entry) => entry.payload.provider), ["opencode-go", "antigravity", "commandcode", "claude-bridge"]);
+});
+
+test("usage-json reports the restored claude-bridge snapshot, and no-data without one", async () => {
+	const store = memoryStore();
+	createClaudeBridgeSource({ store }).capture(CLAUDE_HEADERS, NOW);
+	const restored = createClaudeBridgeSource({ readPlan: () => "max", store });
+	restored.restore(NOW + 1);
+	const empty = createClaudeBridgeSource({ store: memoryStore() });
+	empty.restore(NOW + 1);
+	const document = await collectUsageJson([restored.source, empty.source], { now: NOW + 5 });
+	assert.equal(document.sources[0]?.status, "ok");
+	assert.equal(document.sources[0]?.fetchedAt, NOW);
+	assert.equal(document.sources[0]?.limits[0]?.windows.length, 2);
+	assert.equal(document.sources[1]?.status, "no-data");
+});
+
 test("the extension captures Claude only on a claude-bridge turn", async () => {
 	const emitted: Array<{ name: string; payload: { provider: string; fetch?: unknown } }> = [];
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
@@ -402,7 +528,7 @@ test("the extension captures Claude only on a claude-bridge turn", async () => {
 		on: (event: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(event, handler),
 	};
 	const extensionModule = await import("../extensions/usage-sources.ts");
-	extensionModule.default(fakePi as never, { claudeBridge: { readPlan: () => "max" } } as never);
+	extensionModule.default(fakePi as never, { claudeBridge: { readPlan: () => "max", store: memoryStore() } } as never);
 	// Nothing yet: the provider was never asked for anything, so the shell keeps
 	// its own note instead of recording a failed refresh.
 	assert.deepEqual(emitted.map((entry) => entry.payload.provider), ["opencode-go", "antigravity", "commandcode"]);

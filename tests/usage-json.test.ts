@@ -233,6 +233,7 @@ test("the entry point prints one JSON document and exits 0 when nothing has data
 			OPENCODE_GO_AUTH: missing("no-opencode.json"),
 			COMMANDCODE_AUTH: missing("no-commandcode.json"),
 			CLAUDE_CREDENTIALS: missing("no-claude.json"),
+			CLAUDE_USAGE_SNAPSHOT: missing("no-snapshot.json"),
 			AGY_BIN: missing("no-agy"),
 		},
 	});
@@ -250,6 +251,7 @@ test("the entry point prints one JSON document and exits 0 when nothing has data
 				["opencode-go", "no-data"],
 				["antigravity", "no-data"],
 				["commandcode", "no-data"],
+				["claude-bridge", "no-data"],
 			],
 		);
 	} finally {
