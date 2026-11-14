@@ -184,25 +184,67 @@ not feed the parent panel - those responses belong to the child session, which
 meters itself. Switching the session to a Claude model is what puts them on the
 bar.
 
+## JSON output
+
+The same numbers, for a program instead of a terminal. `usage-json.ts` runs the
+three fetching sources with no pi runtime and no TUI, and writes one JSON
+document to stdout - nothing else, no log line, no colour, no credential:
+
+```sh
+node usage-json.ts
+```
+
+```json
+{"schema":"pi-usage-sources/usage/v1","generatedAt":1792000000000,"sources":[{"provider":"opencode-go","status":"ok","plan":"Go","fetchedAt":1792000000000,"limits":[{"name":"opencode","limitReached":false,"windows":[{"label":"5h","usedPercent":1,"resetAt":1792016212000,"windowSeconds":18000}]}]}]}
+```
+
+`schema` is the contract: `pi-usage-sources/usage/v1`. A field that changes
+meaning bumps it, and nothing is added silently. The document carries one entry
+per built source, in registry order, and each entry says:
+
+- `status` is `ok`, `no-data` or `failed`. `no-data` means the provider had
+  nothing to report - no credential, no agy answer, an endpoint that said
+  nothing - so it carries no numbers and no `error`, never a guess.
+- `failed` carries a short `error` and an empty `limits` array. One provider
+  failing never fails the run.
+- `limits` and their `windows` are the same names and percentages the panel
+  renders. `generatedAt`, `fetchedAt` and `resetAt` are epoch milliseconds, and
+  `resetAt` is `null` when the provider gives no reset, never absent.
+- every source gets a 10s budget, so a provider that hangs is reported `failed`
+  instead of holding the other providers' numbers.
+
+The exit code is 0 whenever the document was printed, even when every source
+failed, because the reader decides from the statuses. A non-zero exit means no
+document at all.
+
+`claude-bridge` is not in the document: that source answers the last snapshot
+Claude Code reported during a session, so there is nothing to fetch headlessly.
+
+No token, key or account identity is in the output - only the providers' own
+numbers.
+
 ## Verify
 
 ```sh
-node --experimental-strip-types --test tests/sources.test.ts   # 28 deterministic tests, no network
-node verify-live.ts                                           # real accounts, real agy
-node verify-contract.ts                                       # the shell's own validator gates
+node --experimental-strip-types --test "tests/*.test.ts"   # 35 deterministic tests, no network
+node verify-live.ts                                        # real accounts, real agy
+node usage-json.ts                                         # the same numbers as JSON, for programs
+node verify-contract.ts                                    # the shell's own validator gates
 ```
 
 `verify-live.ts` prints the current windows and never prints a credential. It
 covers the three providers that fetch; the Claude parser is pinned instead against
 the real shape, taken from `claude --print --verbose --output-format stream-json`
 (CLI 2.1.301), whose `rate_limit_event` is what the bridge rebuilds the headers
-from.
-`verify-contract.ts` exists because gentle-pi's `lib/shell-usage.ts` cannot be
-imported standalone - it imports `@earendil-works/pi-tui`, which Pi injects at
-runtime and which is not on disk - so it reads the validator's constants and
-gates from the installed copies instead, discovering them from
-`$PI_CODING_AGENT_DIR`, `~/.pi/agent`, `~/.gentle-shell/agent` and the global npm
-root. Point it anywhere else with `GENTLE_PI_CONTRACT_FILES`.
+from. `usage-json.ts` prints those same three providers as one versioned
+document, and its tests pin the shape - including that a credential from the
+stores never reaches it. `verify-contract.ts` exists because gentle-pi's
+`lib/shell-usage.ts` cannot be imported standalone - it imports
+`@earendil-works/pi-tui`, which Pi injects at runtime and which is not on disk -
+so it reads the validator's constants and gates from the installed copies
+instead, discovering them from `$PI_CODING_AGENT_DIR`, `~/.pi/agent`,
+`~/.gentle-shell/agent` and the global npm root. Point it anywhere else with
+`GENTLE_PI_CONTRACT_FILES`.
 
 ## Publishing to npm
 
