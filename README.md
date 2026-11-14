@@ -178,6 +178,13 @@ refreshes that provider immediately instead of waiting out the throttle. Before
 the first Claude turn there is nothing to show, and the row keeps the shell's own
 note rather than claiming a failed refresh.
 
+The last Claude snapshot is saved to `~/.pi/agent/usage-sources/claude-bridge.json`
+(override with `CLAUDE_USAGE_SNAPSHOT`), numbers only: no plan label, no
+credential. A new session restores it, minus any window whose reset moment has
+passed, so the row shows the last known usage before the first response instead
+of waiting for it. `r` in the panel re-reads that snapshot; it cannot ask Claude
+for fresher numbers, because Claude Code only reports them with a response.
+
 One limitation worth knowing: the numbers are reported on a `claude-bridge`
 response, so a session that reaches Claude **only** through subagent routes does
 not feed the parent panel - those responses belong to the child session, which
@@ -187,7 +194,7 @@ bar.
 ## JSON output
 
 The same numbers, for a program instead of a terminal. `usage-json.ts` runs the
-three fetching sources with no pi runtime and no TUI, and writes one JSON
+fetching sources (plus the persisted Claude snapshot) with no pi runtime and no TUI, and writes one JSON
 document to stdout - nothing else, no log line, no colour, no credential:
 
 ```sh
@@ -217,8 +224,11 @@ The exit code is 0 whenever the document was printed, even when every source
 failed, because the reader decides from the statuses. A non-zero exit means no
 document at all.
 
-`claude-bridge` is not in the document: that source answers the last snapshot
-Claude Code reported during a session, so there is nothing to fetch headlessly.
+`claude-bridge` is in the document too, but it has nothing to fetch headlessly:
+it answers the last snapshot a pi session persisted (see below). With no
+snapshot, or when every window in it has already reset, it is `no-data`.
+`fetchedAt` is the moment Claude Code reported the numbers, not the moment you
+ran the command, so a reader can tell how old they are.
 
 No token, key or account identity is in the output - only the providers' own
 numbers.
@@ -226,7 +236,7 @@ numbers.
 ## Verify
 
 ```sh
-node --experimental-strip-types --test "tests/*.test.ts"   # 35 deterministic tests, no network
+node --experimental-strip-types --test "tests/*.test.ts"   # 41 deterministic tests, no network
 node verify-live.ts                                        # real accounts, real agy
 node usage-json.ts                                         # the same numbers as JSON, for programs
 node verify-contract.ts                                    # the shell's own validator gates

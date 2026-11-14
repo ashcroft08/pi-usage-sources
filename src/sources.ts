@@ -495,14 +495,95 @@ export function readClaudePlan(env: NodeJS.ProcessEnv = process.env): string | u
 	}
 }
 
+/**
+ * Where the last Claude snapshot survives a restart. Only the numbers are
+ * stored: no plan label, no credential, nothing from Claude Code's own store.
+ * Both methods may throw; the source treats that as "nothing stored".
+ */
+export interface ClaudeSnapshotStore {
+	read(): ProviderUsage | undefined;
+	write(usage: ProviderUsage): void;
+}
+
+/** CLAUDE_USAGE_SNAPSHOT overrides the file, like CLAUDE_CREDENTIALS does for the plan. */
+export function claudeSnapshotFile(env: NodeJS.ProcessEnv = process.env): string {
+	return env.CLAUDE_USAGE_SNAPSHOT ?? path.join(os.homedir(), ".pi", "agent", "usage-sources", "claude-bridge.json");
+}
+
+/** A stored value is trusted only when every field the panel renders is well-formed. */
+function parseSnapshot(value: unknown): ProviderUsage | undefined {
+	const root = record(value);
+	if (!root || root.provider !== CLAUDE_BRIDGE_PROVIDER) return undefined;
+	const fetchedAt = finite(root.fetchedAt);
+	if (fetchedAt === undefined || !Array.isArray(root.limits)) return undefined;
+	const limits: UsageLimit[] = [];
+	for (const rawLimit of root.limits) {
+		const limit = record(rawLimit);
+		if (!limit || typeof limit.name !== "string" || !Array.isArray(limit.windows)) return undefined;
+		const windows: UsageWindow[] = [];
+		for (const rawWindow of limit.windows) {
+			const window = record(rawWindow);
+			const usedPercent = finite(window?.usedPercent);
+			const windowSeconds = finite(window?.windowSeconds);
+			const resetAt = window?.resetAt === null ? null : finite(window?.resetAt);
+			if (!window || typeof window.label !== "string" || usedPercent === undefined || windowSeconds === undefined || resetAt === undefined) return undefined;
+			windows.push({ label: window.label, usedPercent, windowSeconds, resetAt });
+		}
+		limits.push({ name: limit.name, limitReached: limit.limitReached === true, windows });
+	}
+	return { provider: CLAUDE_BRIDGE_PROVIDER, limits, fetchedAt };
+}
+
+/** A JSON file, written through a rename so a concurrent session never reads half of it. */
+export function fileSnapshotStore(file: string = claudeSnapshotFile()): ClaudeSnapshotStore {
+	return {
+		read: () => {
+			try {
+				return parseSnapshot(JSON.parse(fs.readFileSync(file, "utf8")));
+			} catch {
+				return undefined;
+			}
+		},
+		write: (usage) => {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			const temp = `${file}.${process.pid}.tmp`;
+			fs.writeFileSync(temp, JSON.stringify(usage));
+			fs.renameSync(temp, file);
+		},
+	};
+}
+
+/**
+ * A restored snapshot is a past answer: a window whose reset moment has gone is
+ * no longer true, so it is dropped instead of shown. A window that reports no
+ * reset cannot be judged and stays. `limitReached` is cleared when anything was
+ * dropped, because the reset that passed may be the one that had blocked it.
+ */
+function dropElapsedWindows(usage: ProviderUsage, now: number): ProviderUsage | undefined {
+	const limits: UsageLimit[] = [];
+	for (const limit of usage.limits) {
+		const windows = limit.windows.filter((window) => window.resetAt === null || window.resetAt > now);
+		if (windows.length === 0) continue;
+		limits.push({ ...limit, windows, limitReached: limit.limitReached && windows.length === limit.windows.length });
+	}
+	return limits.length > 0 ? { ...usage, limits } : undefined;
+}
+
 export interface ClaudeBridgeDeps {
 	/** The plan label reader. Injected by tests; the real store by default. */
 	readPlan?: () => string | undefined;
+	/** Where the last snapshot survives a restart. Absent: memory only. */
+	store?: ClaudeSnapshotStore;
 }
 
 export interface ClaudeBridgeSource {
 	/** Remembers one captured header set. True when it produced a snapshot. */
 	capture(headers: Record<string, string>, now: number): boolean;
+	/**
+	 * Loads the persisted snapshot, minus windows that already reset. Never
+	 * replaces a snapshot captured in this process. True when it restored one.
+	 */
+	restore(now: number): boolean;
 	hasSnapshot(): boolean;
 	/** The source to emit on `gentle-pi:usage-source/v1`. */
 	source: UsageSource;
@@ -542,6 +623,25 @@ export function createClaudeBridgeSource(deps: ClaudeBridgeDeps = {}): ClaudeBri
 		hasSnapshot: () => latest !== undefined,
 		capture: (headers, now) => {
 			const usage = mapClaudeBridgeHeaders(headers, now);
+			if (!usage) return false;
+			latest = { ...usage, plan: planLabel() };
+			try {
+				deps.store?.write(usage);
+			} catch {
+				// Persisting is a convenience; a full disk must not cost the live numbers.
+			}
+			return true;
+		},
+		restore: (now) => {
+			if (latest) return false;
+			let stored: ProviderUsage | undefined;
+			try {
+				stored = deps.store?.read();
+			} catch {
+				return false;
+			}
+			const valid = parseSnapshot(stored);
+			const usage = valid && dropElapsedWindows(valid, now);
 			if (!usage) return false;
 			latest = { ...usage, plan: planLabel() };
 			return true;

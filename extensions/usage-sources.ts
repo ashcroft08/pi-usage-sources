@@ -11,11 +11,14 @@
 // `rate_limit_event` and hands them to `after_provider_response`. It is
 // registered only once there is a snapshot to answer with.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildSources, createClaudeBridgeSource, CLAUDE_BRIDGE_PROVIDER, USAGE_SOURCE_EVENT, type SourceDeps, type UsageSource } from "../src/sources.ts";
+import { buildSources, createClaudeBridgeSource, fileSnapshotStore, CLAUDE_BRIDGE_PROVIDER, USAGE_SOURCE_EVENT, type SourceDeps, type UsageSource } from "../src/sources.ts";
 
 export default function usageSources(pi: ExtensionAPI, deps: SourceDeps = {}): void {
-	const claudeBridge = createClaudeBridgeSource(deps.claudeBridge);
+	// The last snapshot lives on disk, so a new session starts with the numbers
+	// Claude Code last reported instead of waiting for its first response.
+	const claudeBridge = createClaudeBridgeSource({ store: fileSnapshotStore(), ...deps.claudeBridge });
 	const now = deps.now ?? (() => Date.now());
+	claudeBridge.restore(now());
 	const emit = (source: UsageSource) => pi.events.emit(USAGE_SOURCE_EVENT, source);
 	const register = () => {
 		for (const source of buildSources(deps)) emit(source);
